@@ -42,7 +42,7 @@ DAMAGE_SCALE  = 0.045
 MAX_DAMAGE    = 999
 
 # ── Multijugador ─────────────────────────────────────────────
-SERVER_URL    = ""     # tu servidor de salas, ej: "wss://file-smash.onrender.com" (ver relay_server.py)
+SERVER_URL    = "https://pvp-roq9.onrender.com"     # tu servidor de salas, ej: "wss://file-smash.onrender.com" (ver relay_server.py)
 LAN_PORT      = 8765   # puerto de las salas en red local
 MAX_PLAYERS   = 8
 NET_TICK      = 2      # el host manda el estado cada 2 frames (30 veces por segundo)
