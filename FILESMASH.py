@@ -1,5 +1,5 @@
 """
-FILE SMASH 
+FILE SMASH - by Claudsito
 Battle royale estilo Smash Bros. Los archivos de la carpeta PVP pelean.
 El perdedor cae del escenario y es borrado del disco. 🔥
 Personajes: Kirby (habilidades X), None (solo golpe y salto),
@@ -22,7 +22,10 @@ except Exception:
     HAS_WS = False
 
 # ═══════════════════════ CONFIGURACION ═══════════════════════
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))     # carpeta donde esta este archivo
+if getattr(sys, "frozen", False):                      # ejecutando como .exe (PyInstaller)
+    BASE_DIR  = os.path.dirname(sys.executable)        # carpeta donde esta el .exe
+else:
+    BASE_DIR  = os.path.dirname(os.path.abspath(__file__))   # carpeta donde esta este archivo
 PVP_FOLDER    = os.path.join(BASE_DIR, "PVP")
 WIN_W, WIN_H  = 1000, 620
 FPS           = 60
@@ -3276,12 +3279,37 @@ def play_cpu_mode(screen, clock, archivos):
                     done = True
 
 
+def info_window(lines, secs=25):
+    """Ventana simple con un aviso. Sirve tambien en el .exe, que no tiene consola."""
+    pygame.init()
+    scr  = pygame.display.set_mode((820, 130 + 26 * len(lines)))
+    pygame.display.set_caption("⚔ FILE SMASH ⚔")
+    clk  = pygame.time.Clock()
+    font = pygame.font.SysFont("segoeui", 17)
+    end  = pygame.time.get_ticks() + secs * 1000
+    while pygame.time.get_ticks() < end:
+        scr.fill(C_BG)
+        for i, ln in enumerate(lines):
+            scr.blit(font.render(ln[:105], True, C_WHITE), (24, 24 + i * 26))
+        hint = font.render("Presiona cualquier tecla para cerrar", True, C_GRAY)
+        scr.blit(hint, (24, 130 + 26 * len(lines) - 40))
+        pygame.display.flip()
+        clk.tick(30)
+        for ev in pygame.event.get():
+            if ev.type in (pygame.QUIT, pygame.KEYDOWN):
+                pygame.quit()
+                return
+    pygame.quit()
+
+
 def main():
     global AUDIO_MGR
 
     if not os.path.isdir(PVP_FOLDER):
         os.makedirs(PVP_FOLDER)
-        print(f"Carpeta PVP creada: {PVP_FOLDER}")
+        info_window(["Se creo la carpeta PVP:", PVP_FOLDER, "",
+                     "Pon ahi COPIAS de los archivos que van a pelear (el perdedor se borra en VS CPU)",
+                     "y vuelve a abrir el juego."])
         return
 
     archivos = sorted([
@@ -3290,7 +3318,8 @@ def main():
         if os.path.isfile(os.path.join(PVP_FOLDER, f))
     ])
     if len(archivos) < 1:
-        print("Pon al menos 1 archivo en la carpeta PVP (2 o mas para jugar contra CPUs).")
+        info_window(["La carpeta PVP esta vacia:", PVP_FOLDER, "",
+                     "Pon al menos 1 archivo (2 o mas para jugar contra CPUs) y vuelve a abrir el juego."])
         return
 
     pygame.init()
@@ -3312,4 +3341,21 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        err = traceback.format_exc()
+        try:
+            io_path = os.path.join(BASE_DIR, "error.log")
+            with open(io_path, "w", encoding="utf-8") as fh:
+                fh.write(err)
+        except Exception:
+            pass
+        try:
+            info_window(["El juego tuvo un error (se guardo en error.log):", ""]
+                        + err.strip().splitlines()[-5:], 40)
+        except Exception:
+            pass
