@@ -10,7 +10,7 @@ Los stats dependen del PESO del archivo: pesado = lento y fuerte, liviano = rapi
 
 import pygame
 import os, sys, math, random
-import json, zlib, base64, threading, queue, socket, time
+import json, zlib, base64, threading, queue, socket, time, io, subprocess, tempfile
 from functools import lru_cache
 from PIL import Image as PILImage
 
@@ -20,6 +20,13 @@ try:
     HAS_WS = True
 except Exception:
     HAS_WS = False
+
+# Opening en video: pip install imageio-ffmpeg
+try:
+    import imageio_ffmpeg
+    HAS_FFMPEG = True
+except Exception:
+    HAS_FFMPEG = False
 
 # ═══════════════════════ CONFIGURACION ═══════════════════════
 if getattr(sys, "frozen", False):                      # ejecutando como .exe (PyInstaller)
@@ -42,10 +49,17 @@ DAMAGE_SCALE  = 0.045
 MAX_DAMAGE    = 999
 
 # ── Multijugador ─────────────────────────────────────────────
-SERVER_URL    = "https://pvp-roq9.onrender.com"     # tu servidor de salas, ej: "wss://file-smash.onrender.com" (ver relay_server.py)
+SERVER_URL    = "https://pvp-roq9.onrender.com"     # tu servidor de salas, ej: "wss://file-smash.onrender.com" (ver RELAYSERV.py)
 LAN_PORT      = 8765   # puerto de las salas en red local
 MAX_PLAYERS   = 8
 NET_TICK      = 2      # el host manda el estado cada 2 frames (30 veces por segundo)
+MP_STAKES     = True   # multijugador: el que pierde BORRA su archivo. Pon False para practicar sin riesgo.
+
+# ── Menu / opening ───────────────────────────────────────────
+OPENING_ENABLED = True   # si existe VIDEO/opening.mp4 se reproduce al abrir el juego (X para saltar)
+OPEN_FPS      = 30
+SUDDEN_DEATH_FRAMES = 75 * FPS   # VS CPU: si una ronda dura mas de 75 s, desaparecen las plataformas flotantes
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 
 # ── Audio ────────────────────────────────────────────────────
 # Rutas RELATIVAS: se buscan dentro de la carpeta SFX que esta junto a este archivo.
@@ -65,7 +79,8 @@ AUDIO = {
 # El resto se busca SOLO en SFX/<nombre>.mp3 (o .wav / .ogg). Ejemplo: guarda un sonido
 # de golpe como SFX/hit.mp3 y ya suena. Si el archivo no existe, ese sonido queda en silencio.
 AUDIO_KEYS = ["hit", "ko", "kirby_jump", "kirby_hammer", "kirby_rock", "kirby_sword",
-              "shockwave", "kris_save", "kris_slash", "kris_act", "gamer_phase", "gamer_missile"]
+              "shockwave", "kris_save", "kris_slash", "kris_act", "gamer_phase", "gamer_missile",
+              "menu_move", "menu_ok"]
 for _k in AUDIO_KEYS:
     AUDIO[_k] = ""
     for _ext in (".mp3", ".wav", ".ogg"):
@@ -197,14 +212,15 @@ def size_str(n):
 
 def file_profile(size):
     """Peso del archivo -> stats. t=0 (1 KB o menos): muy liviano ... t=1 (256 MB o mas): muy pesado.
-       Mas pesado : mas lento, mas pesado (cuesta lanzarlo) y pega mas fuerte.
-       Mas liviano: mas rapido, facil de lanzar fuera del campo y pega menos."""
+       Mas pesado : mas lento, ataca mas lento, mas pesado (cuesta lanzarlo) y pega mas fuerte.
+       Mas liviano: mas rapido, ataca rapido, facil de lanzar fuera del campo y pega menos."""
     size = max(1, int(size))
     t = min(1.0, max(0.0, (math.log2(size) - 10.0) / 18.0))
     return {"t": t,
             "weight": 0.7 + 0.8 * t,      # 0.70 .. 1.50
             "speed" : 1.3 - 0.55 * t,     # 1.30 .. 0.75
-            "dmg"   : 0.75 + 0.6 * t}     # 0.75 .. 1.35
+            "dmg"   : 0.75 + 0.6 * t,     # 0.75 .. 1.35
+            "atk"   : 1.35 - 0.65 * t}    # velocidad de ataque: 1.35 (rapido) .. 0.70 (lento)
 
 
 CHARACTERS = ["kirby", "none", "kris", "gamer64"]   # aqui se agregan mas en el futuro
@@ -1505,6 +1521,7 @@ class Fighter:
         self.weight     = prof["weight"]
         self.speed_mod  = prof["speed"]
         self.atk_power  = (16 + random.uniform(0, 4)) * prof["dmg"]
+        self.atk_rate   = prof["atk"]          # velocidad de ataque (cooldown = base / atk_rate)
 
         # Sistema de personaje
         self.kirby = KirbyAbilities(self) if character == "kirby" else None
@@ -1661,13 +1678,13 @@ class Fighter:
             else:
                 self.combo_step = 1
             self.atk_step    = self.combo_step
-            self.combo_timer = 42
-            self.attack_cd   = 50 if self.combo_step == 3 else 16
+            self.combo_timer = int(42 / self.atk_rate)
+            self.attack_cd   = int((50 if self.combo_step == 3 else 16) / self.atk_rate)
             AUDIO_MGR.play("kris_slash")
         elif self.character == "gamer64":
-            self.attack_cd = 24
+            self.attack_cd = int(24 / self.atk_rate)
         else:
-            self.attack_cd = ATTACK_CD
+            self.attack_cd = int(ATTACK_CD / self.atk_rate)
 
     def get_hitbox(self):
         if not self.atk_active:
@@ -1920,7 +1937,7 @@ def make_platforms(n):
 
 # ═══════════════════════ MULTIJUGADOR: RED ═══════════════════════
 # Como funciona (resumen):
-#   - Un servidor "relay" (relay_server.py) une al HOST con los demas jugadores.
+#   - Un servidor "relay" (RELAYSERV.py) une al HOST con los demas jugadores.
 #   - El HOST es el unico que simula la pelea. Cada jugador le manda sus teclas
 #     y el host le devuelve el estado de todos (30 veces por segundo, comprimido).
 #   - Cada jugador solo manda LAS TECLAS y una imagen pequeña de su archivo:
@@ -2191,7 +2208,7 @@ class NetClient:
 
 def make_player_info(path, char):
     surf = load_sprite(path)
-    return {"name": os.path.basename(path)[:40], "char": char,
+    return {"name": os.path.basename(path)[:40], "char": char, "path": path,
             "size": max(1, os.path.getsize(path)), "surf": surf, "spr": encode_sprite(surf)}
 
 
@@ -2208,6 +2225,8 @@ class MPSession:
         self.error        = ""
         self.players      = {}
         self._stop_local  = None
+        self.stake_lost   = False        # True si en esta pelea perdiste (y se borro) tu archivo
+        self.stakes       = MP_STAKES    # la sala juega con apuesta
 
     # ── conectar ────────────────────────────────────────────
     def host(self, lan=False):
@@ -2216,10 +2235,10 @@ class MPSession:
             try:
                 if BASE_DIR not in sys.path:
                     sys.path.insert(0, BASE_DIR)
-                import relay_server
+                import RELAYSERV
             except Exception as e:
-                return self._fail(f"Falta relay_server.py junto al juego (o la libreria websockets): {e}")
-            _th, stop, err = relay_server.start_background(LAN_PORT)
+                return self._fail(f"Falta RELAYSERV.py junto al juego (o la libreria websockets): {e}")
+            _th, stop, err = RELAYSERV.start_background(LAN_PORT)
             if err is not None:
                 return self._fail(f"No se pudo abrir el puerto {LAN_PORT} (¿ya hay una sala abierta?): {err}")
             self._stop_local = stop
@@ -2228,7 +2247,7 @@ class MPSession:
         else:
             if not SERVER_URL:
                 return self._fail("Falta configurar SERVER_URL al inicio de file_smash.py "
-                                  "(ver relay_server.py). Mientras tanto usa la sala LAN.")
+                                  "(ver RELAYSERV.py). Mientras tanto usa la sala LAN.")
             url = SERVER_URL
         self.net = NetClient()
         self.net.start(url, {"t": "host"})
@@ -2266,7 +2285,7 @@ class MPSession:
             self.net.send({"to": "all", "d": d})
 
     def _roster_msg(self):
-        return {"t": "roster", "players": [
+        return {"t": "roster", "stakes": MP_STAKES, "players": [
             {"pid": pid, "name": p["name"], "char": p["char"], "size": p["size"]}
             for pid, p in sorted(self.players.items())]}
 
@@ -2278,9 +2297,18 @@ class MPSession:
         plist = [{"pid": pid, "name": p["name"], "char": p["char"], "size": p["size"], "spr": p["spr"]}
                  for pid, p in sorted(self.players.items())]
         plats = make_platforms(len(plist))
-        self.send_all({"t": "start", "players": plist,
+        self.send_all({"t": "start", "players": plist, "stakes": MP_STAKES,
                        "plats": [[r.x, r.y, r.w, r.h] for r in plats]})
         return plist, plats
+
+    def change_me(self, info):
+        """Cambias de archivo (por ejemplo porque perdiste el anterior)."""
+        self.me = info
+        if self.role == "host":
+            self.players[0] = dict(info)
+            self._broadcast_roster()
+        elif self.net is not None and self.net.state == "open":
+            self.net.send(self._hello())
 
     def after_match(self):
         if self.role == "host" and self.status == "lobby":
@@ -2367,6 +2395,7 @@ class MPSession:
                 self.net.send(self._hello())
             elif t == "roster":
                 self.players = {p["pid"]: p for p in msg.get("players", [])}
+                self.stakes = bool(msg.get("stakes", False))
                 ev.append(("roster",))
             elif t == "start":
                 ev.append(("start", msg))
@@ -2408,6 +2437,7 @@ def _draw_banner(screen, text, color=C_YELLOW, y=WIN_H // 2):
 def run_mp_host_match(screen, clock, sess, plist, plats, input_fn=None, max_frames=None):
     """Pelea multijugador vista desde el HOST (es quien simula). Devuelve el pid ganador o None."""
     MATCH_STATE.clear()
+    sess.stake_lost = False
     AUDIO_MGR.play_music("music_battle")
     sprites  = {p["pid"]: sess.players[p["pid"]]["surf"] for p in plist}
     fighters = _build_fighters(plist, plats, sprites, 0, True)
@@ -2448,6 +2478,8 @@ def run_mp_host_match(screen, clock, sess, plist, plats, input_fn=None, max_fram
         for f in fighters:
             f.draw(screen)
         draw_hud(screen, fighters, 1, 1, title=title)
+        if sess.stake_lost:
+            _draw_banner(screen, f"Tu archivo «{sess.me['name'][:30]}» fue BORRADO", C_RED, 110)
         if extra:
             extra()
 
@@ -2517,7 +2549,9 @@ def run_mp_host_match(screen, clock, sess, plist, plats, input_fn=None, max_fram
                             AUDIO_MGR.play("hit")
             if f.is_out_of_bounds():
                 f.alive = False
-                AUDIO_MGR.play("ko")        # (en multijugador NO se borra ningun archivo)
+                AUDIO_MGR.play("ko")
+                if f.pid == 0 and MP_STAKES and delete_stake_file(sess.me["path"]):
+                    sess.stake_lost = True      # el host perdio: su archivo se borra
 
         if st["frame"] % NET_TICK == 0:
             send_snapshot()
@@ -2535,7 +2569,7 @@ def run_mp_host_match(screen, clock, sess, plist, plats, input_fn=None, max_fram
     sess.send_all({"t": "end", "winner": winner.pid if winner else -1})
     for _ in range(FPS * 2):
         net_events()
-        msg = f"🏆  {winner.name[:40]}  GANA!" if winner else "Empate"
+        msg = f"{winner.name[:40]}  GANA!" if winner else "Empate"
         draw_all(lambda: _draw_banner(screen, msg))
         pygame.display.flip()
         clock.tick(FPS)
@@ -2576,17 +2610,30 @@ def run_mp_client_match(screen, clock, sess, start_msg, input_fn=None, max_frame
     big      = get_font("segoeui", 48, True)
     title    = f"FILE SMASH  —  Sala {pretty_code(sess.display_code or sess.code)}  —  {len(fighters)} jugadores"
     cd_text, cd_frame = "", -999
+    sess.stake_lost = False
+    stakes_on = bool(start_msg.get("stakes")) and MP_STAKES
+    fighting, lost_done = False, False
     end_msg, end_frames = None, 0
     frame, last_mask, last_send = 0, -1, -99
 
     while True:
         for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
-            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+            if ev.type == pygame.QUIT or (ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE):
+                if stakes_on and fighting and mine is not None and mine.alive and end_msg is None:
+                    if not confirm_modal(
+                            screen, clock,
+                            ["¿SALIR DE LA PELEA?", "",
+                             "Salir ahora cuenta como derrota:",
+                             f"tu archivo «{sess.me['name'][:40]}» se BORRARA para siempre."], C_RED,
+                            f"{key_label('confirm')}: salir y perder", f"{key_label('back')}: seguir peleando"):
+                        continue
+                    if delete_stake_file(sess.me["path"]):
+                        sess.stake_lost = True
                 sess.close()
                 sess.status = "closed"
                 AUDIO_MGR.stop_music()
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
                 return "left"
             local.on_event(ev)
         mask, edges = input_fn(frame) if input_fn else local.read()
@@ -2600,12 +2647,21 @@ def run_mp_client_match(screen, clock, sess, start_msg, input_fn=None, max_frame
                     AUDIO_MGR.play(k)
             elif e[0] == "cd":
                 cd_text, cd_frame = e[1].get("n", ""), frame
+                if cd_text.startswith("¡"):
+                    fighting = True
             elif e[0] == "end" and end_msg is None:
                 end_msg = e[1]
             elif e[0] in ("host_left", "closed"):
                 AUDIO_MGR.stop_music()
                 # si la pelea ya habia terminado, no es un error: el host solo cerro despues
                 return "done" if end_msg is not None else "closed"
+
+        # Si te eliminaron, tu archivo apostado se borra (solo si la pelea no se cancelo)
+        if (stakes_on and fighting and not lost_done and mine is not None and not mine.alive
+                and (end_msg is None or end_msg.get("winner") != -2)):
+            lost_done = True
+            if delete_stake_file(sess.me["path"]):
+                sess.stake_lost = True
 
         # suavizado entre snapshots (el host manda 30/s, dibujamos a 60/s)
         for f in fighters:
@@ -2621,18 +2677,21 @@ def run_mp_client_match(screen, clock, sess, start_msg, input_fn=None, max_frame
         for f in fighters:
             f.draw(screen)
         draw_hud(screen, fighters, 1, 1, title=title)
+        if sess.stake_lost:
+            _draw_banner(screen, f"Tu archivo «{sess.me['name'][:30]}» fue BORRADO", C_RED, 110)
         if cd_text and frame - cd_frame < (45 if cd_text.startswith("¡") else 55):
             lbl = big.render(cd_text, True, C_YELLOW)
             screen.blit(lbl, lbl.get_rect(center=(WIN_W // 2, WIN_H // 2)))
         if mine is not None and not mine.alive and end_msg is None:
-            _draw_banner(screen, "ELIMINADO — mirando la pelea (ESC para salir)", C_RED, 70)
+            _draw_banner(screen, "ELIMINADO - mirando la pelea (ESC para salir)", C_RED, 70)
         if end_msg is not None:
             w = end_msg.get("winner", -1)
             wf = next((f for f in fighters if f.pid == w), None)
             if w == -2:
                 _draw_banner(screen, "El host cancelo la partida")
             elif wf is not None:
-                _draw_banner(screen, f"🏆  {wf.name[:40]}  GANA!")
+                _draw_banner(screen, f"{wf.name[:40]}  GANA!" + ("   (conservas tu archivo)"
+                                                                if (wf.pid == sess.pid and stakes_on) else ""))
             else:
                 _draw_banner(screen, "Empate")
             end_frames += 1
@@ -2674,55 +2733,6 @@ def mp_message(screen, clock, text, secs=2.5, color=C_YELLOW):
                 return
 
 
-def mode_screen(screen, clock, n_archivos):
-    AUDIO_MGR.play_music("music_menu")
-    font_t = get_font("segoeui", 36, True)
-    font_b = get_font("segoeui", 22, True)
-    font_s = get_font("segoeui", 14)
-    btn_cpu = pygame.Rect(WIN_W // 2 - 260, 190, 520, 90)
-    btn_mp  = pygame.Rect(WIN_W // 2 - 260, 310, 520, 90)
-    cpu_ok  = n_archivos >= 2
-    while True:
-        screen.fill(C_BG)
-        t = font_t.render("⚔  FILE SMASH  ⚔", True, C_YELLOW)
-        screen.blit(t, t.get_rect(center=(WIN_W // 2, 70)))
-        sub = font_s.render("Mientras mas PESADO es el archivo: mas lento y pesado, pero mas daño.  "
-                            "Mientras mas LIVIANO: mas rapido, pero mas facil de lanzar.", True, C_GRAY)
-        screen.blit(sub, sub.get_rect(center=(WIN_W // 2, 120)))
-
-        for rect, txt, line2, ok, col in (
-            (btn_cpu, "1   VS CPU", "Todos los archivos de PVP pelean. El perdedor se BORRA del disco."
-             if cpu_ok else "Necesitas al menos 2 archivos en la carpeta PVP", cpu_ok, C_ORANGE),
-            (btn_mp, "2   MULTIJUGADOR", "Hasta 8 jugadores con codigo de sala. No se borra nada.", True, C_CYAN),
-        ):
-            pygame.draw.rect(screen, col if ok else (60, 60, 70), rect, border_radius=10)
-            pygame.draw.rect(screen, C_YELLOW if ok else C_GRAY, rect, 2, border_radius=10)
-            a = font_b.render(txt, True, C_DARK)
-            b = font_s.render(line2, True, C_DARK)
-            screen.blit(a, a.get_rect(center=(rect.centerx, rect.y + 32)))
-            screen.blit(b, b.get_rect(center=(rect.centerx, rect.y + 62)))
-        hint = font_s.render("ESC para salir", True, C_GRAY)
-        screen.blit(hint, hint.get_rect(center=(WIN_W // 2, WIN_H - 30)))
-        pygame.display.flip()
-        clock.tick(FPS)
-
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                return None
-            if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
-                    return None
-                if ev.key in (pygame.K_1, pygame.K_KP1) and cpu_ok:
-                    return "cpu"
-                if ev.key in (pygame.K_2, pygame.K_KP2):
-                    return "mp"
-            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                if btn_cpu.collidepoint(ev.pos) and cpu_ok:
-                    return "cpu"
-                if btn_mp.collidepoint(ev.pos):
-                    return "mp"
-
-
 def mp_pick_screen(screen, clock, archivos):
     """Elige TU archivo y TU personaje para el multijugador."""
     font_t  = get_font("segoeui", 28, True)
@@ -2734,7 +2744,8 @@ def mp_pick_screen(screen, clock, archivos):
         screen.fill(C_BG)
         t = font_t.render("MULTIJUGADOR  —  elige tu archivo y tu personaje", True, C_YELLOW)
         screen.blit(t, t.get_rect(center=(WIN_W // 2, 34)))
-        h = font_xs.render("↑↓ archivo   ←→ personaje   ENTER continuar   ESC volver", True, C_CYAN)
+        h = font_xs.render(f"↑↓ archivo   ←→ personaje   {key_label('confirm')} continuar   {key_label('back')} volver",
+                           True, C_CYAN)
         screen.blit(h, h.get_rect(center=(WIN_W // 2, 68)))
 
         for i, path in enumerate(archivos[scroll:scroll + VIS]):
@@ -2766,9 +2777,10 @@ def mp_pick_screen(screen, clock, archivos):
         _stat_bar(screen, px, 172, "Velocidad", prof["speed"], 0.75, 1.30, C_CYAN)
         _stat_bar(screen, px, 192, "Peso     ", prof["weight"], 0.70, 1.50, C_YELLOW)
         _stat_bar(screen, px, 212, "Daño     ", prof["dmg"], 0.75, 1.35, C_RED)
-        screen.blit(font_b.render("PERSONAJE", True, C_ORANGE), (px, 252))
-        ch = font_t.render(f"◀  {CHARACTERS[ci].upper()}  ▶", True, C_PINK)
-        screen.blit(ch, (px, 280))
+        _stat_bar(screen, px, 232, "Ataque   ", prof["atk"], 0.70, 1.35, C_GREEN)
+        screen.blit(font_b.render("PERSONAJE", True, C_ORANGE), (px, 276))
+        ch = font_t.render(f"<  {CHARACTERS[ci].upper()}  >", True, C_PINK)
+        screen.blit(ch, (px, 304))
 
         for i, line in enumerate(HAB_INFO[CHARACTERS[ci]]):
             hl = font_xs.render(line, True, C_PINK)
@@ -2780,9 +2792,9 @@ def mp_pick_screen(screen, clock, archivos):
             if ev.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
             if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
+                if is_back(ev):
                     return None
-                if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                if is_confirm(ev):
                     return archivos[sel], CHARACTERS[ci]
                 if ev.key == pygame.K_DOWN:
                     sel = (sel + 1) % len(archivos)
@@ -2810,7 +2822,7 @@ def mp_mode_screen(screen, clock):
     font_s = get_font("segoeui", 14)
     opts = [
         ("host_online", "1   CREAR SALA ONLINE", "Usa el servidor configurado en SERVER_URL" if SERVER_URL
-         else "⚠ Falta configurar SERVER_URL (ver relay_server.py)", bool(SERVER_URL), C_ORANGE),
+         else "(!) Falta configurar SERVER_URL (ver RELAYSERV.py)", bool(SERVER_URL), C_ORANGE),
         ("host_lan", "2   CREAR SALA EN RED LOCAL (LAN)", "Para jugar en la misma casa / wifi, sin servidor", True, C_GREEN),
         ("join", "3   UNIRSE A UNA SALA", "Escribe el codigo que te paso el host", True, C_CYAN),
     ]
@@ -2826,7 +2838,7 @@ def mp_mode_screen(screen, clock):
             b = font_s.render(sub, True, C_DARK)
             screen.blit(a, a.get_rect(center=(rect.centerx, rect.y + 28)))
             screen.blit(b, b.get_rect(center=(rect.centerx, rect.y + 58)))
-        hint = font_s.render("ESC para volver", True, C_GRAY)
+        hint = font_s.render(f"{key_label('back')}: volver", True, C_GRAY)
         screen.blit(hint, hint.get_rect(center=(WIN_W // 2, WIN_H - 30)))
         pygame.display.flip()
         clock.tick(FPS)
@@ -2834,7 +2846,7 @@ def mp_mode_screen(screen, clock):
             if ev.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
             if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
+                if is_back(ev):
                     return None
                 for k, (key, _t, _s, ok, _c) in zip((pygame.K_1, pygame.K_2, pygame.K_3), opts):
                     if ev.key == k and ok:
@@ -2893,6 +2905,8 @@ def mp_lobby(screen, clock, sess):
                 if res == "closed":
                     mp_message(screen, clock, "El host cerro la sala", 2.5, C_RED)
                     return
+                if not _after_match(screen, clock, sess):
+                    return
             elif e[0] in ("host_left", "closed"):
                 mp_message(screen, clock, "La sala se cerro (el host se fue o se perdio la conexion)", 3, C_RED)
                 return
@@ -2937,12 +2951,16 @@ def mp_lobby(screen, clock, sess):
                 screen.blit(right, (row.right - right.get_width() - 10, row.y + 9))
             n = len(sess.players)
             if sess.role == "host":
-                msg = (f"ENTER: empezar ({n}/{MAX_PLAYERS} jugadores)   ·   ESC: cerrar sala" if n >= 2
-                       else "Esperando jugadores...  (necesitas al menos 2)   ·   ESC: cerrar sala")
+                msg = (f"{key_label('confirm')}: empezar ({n}/{MAX_PLAYERS} jugadores)   ·   {key_label('back')}: cerrar sala"
+                       if n >= 2 else
+                       f"Esperando jugadores...  (necesitas al menos 2)   ·   {key_label('back')}: cerrar sala")
             else:
-                msg = "Esperando a que el host empiece la partida...   ·   ESC: salir"
+                msg = f"Esperando a que el host empiece la partida...   ·   {key_label('back')}: salir"
             hl = font_s.render(msg, True, C_ORANGE)
             screen.blit(hl, hl.get_rect(center=(WIN_W // 2, WIN_H - 30)))
+            if MP_STAKES and (sess.role == "host" or sess.stakes):
+                wl = font_s.render("APUESTA ACTIVA: el que pierda BORRA su archivo para siempre", True, C_RED)
+                screen.blit(wl, wl.get_rect(center=(WIN_W // 2, WIN_H - 62)))
         pygame.display.flip()
         clock.tick(FPS)
 
@@ -2950,26 +2968,35 @@ def mp_lobby(screen, clock, sess):
             if ev.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
             if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
+                if is_back(ev):
                     return
-                if (ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and sess.role == "host"
+                if (is_confirm(ev) and sess.role == "host"
                         and sess.status == "lobby" and len(sess.players) >= 2):
                     plist, plats = sess.host_start()
                     run_mp_host_match(screen, clock, sess, plist, plats)
                     sess.after_match()
                     AUDIO_MGR.play_music("music_menu")
+                    if not _after_match(screen, clock, sess):
+                        return
 
 
-def multiplayer_menu(screen, clock, archivos):
+def multiplayer_menu(screen, clock):
     if not HAS_WS:
         mp_message(screen, clock, "Falta la libreria de red.\nInstalala con:  pip install websockets", 4, C_RED)
         return
-    pick = mp_pick_screen(screen, clock, archivos)
-    if not pick:
-        return
-    path, char = pick
-    me = make_player_info(path, char)
+    me = None
     while True:
+        if me is None or not os.path.exists(me["path"]):
+            files = list_pvp_files()
+            if not files:
+                mp_message(screen, clock, "No hay archivos en la carpeta PVP.", 3, C_RED)
+                return
+            pick = mp_pick_screen(screen, clock, files)
+            if not pick:
+                return
+            if MP_STAKES and not mp_confirm_stake(screen, clock, pick[0]):
+                continue                                   # no acepto la apuesta: elige otro
+            me = make_player_info(*pick)
         choice = mp_mode_screen(screen, clock)
         if choice is None:
             return
@@ -2982,8 +3009,736 @@ def multiplayer_menu(screen, clock, archivos):
         else:
             sess.host(lan=(choice == "host_lan"))
         mp_lobby(screen, clock, sess)
+        me = sess.me                                       # por si cambiaste de archivo dentro de la sala
         sess.close()
         AUDIO_MGR.play_music("music_menu")
+
+
+# ═══════════════════════ CONTROLES DE MENU, AVISOS Y APUESTA ═══════════════════════
+
+# Teclas de los menus. Por defecto: Z = continuar, X = volver.
+# (Enter y Esc siguen funcionando tambien. Mas adelante se podran cambiar en Configuracion.)
+MENU_KEYS = {"confirm": pygame.K_z, "back": pygame.K_x}
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        for k in MENU_KEYS:
+            v = data.get("keys", {}).get(k)
+            if isinstance(v, int):
+                MENU_KEYS[k] = v
+    except Exception:
+        pass
+
+
+def save_settings():
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"keys": MENU_KEYS}, fh)
+    except Exception:
+        pass
+
+
+def key_label(which):
+    return pygame.key.name(MENU_KEYS[which]).upper()
+
+
+def is_confirm(ev):
+    return ev.type == pygame.KEYDOWN and ev.key in (MENU_KEYS["confirm"], pygame.K_RETURN, pygame.K_KP_ENTER)
+
+
+def is_back(ev):
+    return ev.type == pygame.KEYDOWN and ev.key in (MENU_KEYS["back"], pygame.K_ESCAPE)
+
+
+def list_pvp_files():
+    try:
+        return sorted(os.path.join(PVP_FOLDER, f) for f in os.listdir(PVP_FOLDER)
+                      if os.path.isfile(os.path.join(PVP_FOLDER, f)))
+    except OSError:
+        return []
+
+
+def delete_stake_file(path):
+    """Borra PARA SIEMPRE el archivo apostado. Solo toca archivos que estan dentro de la carpeta PVP."""
+    try:
+        real = os.path.realpath(path)
+        if not real.startswith(os.path.realpath(PVP_FOLDER) + os.sep):
+            return False
+        os.remove(real)
+        print(f"[BORRADO] {real}")
+        return True
+    except OSError as e:
+        print(f"[no se pudo borrar] {path}: {e}")
+        return False
+
+
+def confirm_modal(screen, clock, lines, color=C_RED, yes_txt=None, no_txt=None):
+    """Ventana de confirmacion encima de lo que haya en pantalla. True = continuar, False = volver."""
+    bg = screen.copy()
+    shade = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+    shade.fill((0, 0, 0, 175))
+    f1 = get_font("segoeui", 24, True)
+    f2 = get_font("segoeui", 16)
+    yes = yes_txt or f"{key_label('confirm')}: si"
+    no  = no_txt or f"{key_label('back')}: no"
+    h = 120 + 28 * len(lines)
+    box = pygame.Rect(WIN_W // 2 - 400, WIN_H // 2 - h // 2, 800, h)
+    while True:
+        screen.blit(bg, (0, 0))
+        screen.blit(shade, (0, 0))
+        pygame.draw.rect(screen, C_DARK, box, border_radius=12)
+        pygame.draw.rect(screen, color, box, 3, border_radius=12)
+        for i, ln in enumerate(lines):
+            lbl = (f1 if i == 0 else f2).render(ln, True, color if i == 0 else C_WHITE)
+            screen.blit(lbl, lbl.get_rect(center=(WIN_W // 2, box.y + 36 + i * 28)))
+        hint = f2.render(f"{yes}        {no}", True, C_YELLOW)
+        screen.blit(hint, hint.get_rect(center=(WIN_W // 2, box.bottom - 30)))
+        pygame.display.flip()
+        clock.tick(FPS)
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if is_confirm(ev):
+                return True
+            if is_back(ev):
+                return False
+
+
+def mp_confirm_stake(screen, clock, path):
+    name = os.path.basename(path)
+    return confirm_modal(
+        screen, clock,
+        ["APUESTA TU ARCHIVO", "",
+         f"Si pierdes, «{name[:44]}» se BORRARA de tu PC para siempre.",
+         "Todos en la sala apuestan igual.  Apuesta una COPIA, nunca tu unico archivo.", ""],
+        yes_txt=f"{key_label('confirm')}: acepto el riesgo", no_txt=f"{key_label('back')}: volver")
+
+
+def _after_match(screen, clock, sess):
+    """Si perdiste tu archivo en la pelea, tienes que apostar otro para seguir en la sala."""
+    if not sess.stake_lost:
+        return True
+    sess.stake_lost = False
+    lost = sess.me["name"]
+    files = list_pvp_files()
+    if not files:
+        mp_message(screen, clock, f"Tu archivo «{lost}» fue BORRADO.\nYa no te quedan archivos en PVP.", 4, C_RED)
+        return False
+    mp_message(screen, clock, f"Tu archivo «{lost}» fue BORRADO.\nElige otro archivo para seguir en la sala.", 3, C_RED)
+    pick = mp_pick_screen(screen, clock, files)
+    if not pick:
+        return False
+    if sess.stakes and MP_STAKES and not mp_confirm_stake(screen, clock, pick[0]):
+        return False
+    sess.change_me(make_player_info(*pick))
+    return True
+
+
+# ═══════════════════════ SUBMENU "FIGHT" ═══════════════════════
+
+def mode_screen(screen, clock, n_archivos):
+    AUDIO_MGR.play_music("music_menu")
+    font_t = get_font("segoeui", 36, True)
+    font_b = get_font("segoeui", 22, True)
+    font_s = get_font("segoeui", 14)
+    btn_cpu = pygame.Rect(WIN_W // 2 - 260, 190, 520, 90)
+    btn_mp  = pygame.Rect(WIN_W // 2 - 260, 310, 520, 90)
+    cpu_ok  = n_archivos >= 2
+    mp_line = ("Hasta 8 jugadores con codigo de sala. El que pierde BORRA su archivo." if MP_STAKES
+               else "Hasta 8 jugadores con codigo de sala. (modo practica: no se borra nada)")
+    while True:
+        screen.fill(C_BG)
+        t = font_t.render("FIGHT", True, C_YELLOW)
+        screen.blit(t, t.get_rect(center=(WIN_W // 2, 60)))
+        for i, ln in enumerate((
+                "PESADO: mas lento, ataques lentos, pega fuerte y cuesta lanzarlo.",
+                "LIVIANO: mas rapido, ataques rapidos, pega menos y es facil de lanzar.")):
+            sub = font_s.render(ln, True, C_GRAY)
+            screen.blit(sub, sub.get_rect(center=(WIN_W // 2, 108 + i * 20)))
+
+        for rect, txt, line2, ok, col in (
+            (btn_cpu, "VS CPU", "Todos los archivos de PVP pelean. El perdedor se BORRA del disco."
+             if cpu_ok else "Necesitas al menos 2 archivos en la carpeta PVP", cpu_ok, C_ORANGE),
+            (btn_mp, "MULTIJUGADOR", mp_line, True, C_CYAN),
+        ):
+            pygame.draw.rect(screen, col if ok else (60, 60, 70), rect, border_radius=10)
+            pygame.draw.rect(screen, C_YELLOW if ok else C_GRAY, rect, 2, border_radius=10)
+            a = font_b.render(txt, True, C_DARK)
+            b = font_s.render(line2, True, C_DARK)
+            screen.blit(a, a.get_rect(center=(rect.centerx, rect.y + 32)))
+            screen.blit(b, b.get_rect(center=(rect.centerx, rect.y + 62)))
+        hint = font_s.render(f"1 / 2 o clic para elegir      {key_label('back')}: volver", True, C_GRAY)
+        screen.blit(hint, hint.get_rect(center=(WIN_W // 2, WIN_H - 30)))
+        pygame.display.flip()
+        clock.tick(FPS)
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if is_back(ev):
+                return None
+            if ev.type == pygame.KEYDOWN:
+                if ev.key in (pygame.K_1, pygame.K_KP1) and cpu_ok:
+                    return "cpu"
+                if ev.key in (pygame.K_2, pygame.K_KP2):
+                    return "mp"
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                if btn_cpu.collidepoint(ev.pos) and cpu_ok:
+                    return "cpu"
+                if btn_mp.collidepoint(ev.pos):
+                    return "mp"
+
+
+# ═══════════════════════ MENU PRINCIPAL (copia de tu dibujo) ═══════════════════════
+# El arte de los 4 bloques y la imagen de la derecha salen de tu dibujo (guardados aqui dentro).
+# Para cambiar el texto de la derecha edita NEWS_TITLE / NEWS_BODY.
+# Para cambiar la imagen: pon un archivo  news.png  junto al juego.
+
+NEWS_TITLE = "V.1 IS HERE!!"
+NEWS_BODY = [
+    "Enjoy the BETA VERSION of FILES PVP!!",
+    "In this Game, you grab your files, and you make them fight until theres only one left",
+    "All the files are on your hands, even if it is on pvp, OR IN STORY MODE!!",
+    "Fight against the unraveled SYSTEM32! AND SAVE YOUR LAPTOP FROM DESTRUCTION!",
+]
+
+PANEL_GRAY = (195, 195, 195)
+
+# Poligonos de cada boton, en coordenadas del dibujo original (470 x 522)
+MENU_POLY = {
+    "fight":      [(0, 0), (222, 0), (224, 207), (0, 226)],
+    "story":      [(222, 0), (480, 0), (480, 215), (224, 207)],
+    "characters": [(0, 226), (224, 207), (480, 215), (480, 396), (0, 392.5)],
+    "settings":   [(0, 392.5), (480, 396), (480, 522), (0, 522)],
+}
+
+MENU_ART_B64 = (
+    "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"
+)
+
+MENU_PREVIEW_B64 = (
+    "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"
+)
+
+_MENU = {}
+
+
+def _wrap_text(font, text, width):
+    lines, cur = [], ""
+    for w in text.split():
+        test = (cur + " " + w).strip()
+        if font.size(test)[0] <= width:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _menu_assets():
+    if _MENU:
+        return _MENU
+    from PIL import ImageDraw, ImageChops
+    resample = getattr(PILImage, "LANCZOS", None) or PILImage.Resampling.LANCZOS
+    s = WIN_H / 522.0                                   # el dibujo se escala al alto de la ventana
+
+    art_img = PILImage.open(io.BytesIO(base64.b64decode(MENU_ART_B64))).convert("RGBA")
+    sw, sh = int(round(art_img.width * s)), WIN_H
+    art_s = art_img.resize((sw, sh), resample)
+    art = pygame.image.fromstring(art_s.tobytes(), (sw, sh), "RGBA")
+    alpha = art_s.getchannel("A")
+
+    regions = {}
+    white = PILImage.new("L", (sw, sh), 255)
+    for name, pts in MENU_POLY.items():
+        pm = PILImage.new("L", (sw, sh), 0)
+        ImageDraw.Draw(pm).polygon([(x * s, y * s) for x, y in pts], fill=255)
+        pm = ImageChops.multiply(pm, alpha)
+        overlay = pygame.image.fromstring(PILImage.merge("RGBA", (white, white, white, pm)).tobytes(),
+                                          (sw, sh), "RGBA")
+        mask = pygame.mask.from_surface(overlay, 128)
+        biggest = max(mask.connected_components(), key=lambda m: m.count())
+        regions[name] = {"mask": mask, "overlay": overlay, "outline": biggest.outline(3)}
+
+    # ── panel de la derecha ──
+    zig_x = int(466 * s)
+    cw = int(293 * s)
+    px0 = zig_x + (WIN_W - zig_x - cw) // 2
+    pcx = px0 + cw // 2
+
+    pw, ph = int(266 * s), int(182 * s)
+    prev_img = None
+    news = os.path.join(BASE_DIR, "news.png")
+    try:
+        prev_img = PILImage.open(news if os.path.exists(news) else io.BytesIO(base64.b64decode(MENU_PREVIEW_B64)))
+        prev_img = prev_img.convert("RGB").resize((pw, ph), resample)
+    except Exception:
+        prev_img = PILImage.open(io.BytesIO(base64.b64decode(MENU_PREVIEW_B64))).convert("RGB").resize((pw, ph), resample)
+    preview = pygame.image.fromstring(prev_img.tobytes(), (pw, ph), "RGB")
+
+    title_font = pygame.font.SysFont("impact,arialblack,arial", int(round(34 * s)), italic=True)
+    title = title_font.render(NEWS_TITLE, True, (255, 255, 255))
+
+    body, y_end = [], 0
+    for size in range(int(round(17 * s)), 11, -1):
+        font = pygame.font.SysFont("arial", size, bold=True)
+        line_h = int(round(size * 1.14))
+        y = int(262 * s)
+        body = []
+        for para in NEWS_BODY:
+            for ln in _wrap_text(font, para, cw):
+                body.append((font.render(ln, True, (255, 255, 255)), (px0, y)))
+                y += line_h
+            y += line_h                                   # linea en blanco entre parrafos
+        y_end = y - line_h
+        if y_end <= WIN_H - 12:
+            break
+
+    _MENU.update({
+        "art": art, "regions": regions, "preview": preview,
+        "preview_pos": (pcx - pw // 2, int(28 * s)),
+        "title": title, "title_pos": (pcx - title.get_width() // 2, int(222 * s)),
+        "body": body,
+    })
+    return _MENU
+
+
+def _menu_hit(A, pos):
+    x, y = pos
+    for name, r in A["regions"].items():
+        w, h = r["mask"].get_size()
+        if 0 <= x < w and 0 <= y < h and r["mask"].get_at((x, y)):
+            return name
+    return None
+
+
+def main_menu(screen, clock):
+    """Menu principal. Devuelve 'fight', 'story', 'characters', 'settings' o None (salir)."""
+    A = _menu_assets()
+    AUDIO_MGR.play_music("music_menu")
+    sel, last_top, t = "fight", "fight", 0
+    font_h = get_font("segoeui", 14)
+    while True:
+        t += 1
+        screen.fill(PANEL_GRAY)
+        screen.blit(A["art"], (0, 0))
+        screen.blit(A["preview"], A["preview_pos"])
+        screen.blit(A["title"], A["title_pos"])
+        for surf, pos in A["body"]:
+            screen.blit(surf, pos)
+
+        reg = A["regions"][sel]
+        pulse = 0.5 + 0.5 * math.sin(t * 0.12)
+        reg["overlay"].set_alpha(int(20 + 45 * pulse))
+        screen.blit(reg["overlay"], (0, 0))
+        if len(reg["outline"]) > 2:
+            pygame.draw.lines(screen, (255, 255, 255), True, reg["outline"], 4)
+
+        hint = font_h.render(f"{key_label('confirm')}: continuar     {key_label('back')}: volver", True, (80, 80, 80))
+        screen.blit(hint, (WIN_W - hint.get_width() - 14, 8))
+        pygame.display.flip()
+        clock.tick(FPS)
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return None
+            if ev.type == pygame.KEYDOWN:
+                old = sel
+                if ev.key == pygame.K_LEFT and sel == "story":
+                    sel = "fight"
+                elif ev.key == pygame.K_RIGHT and sel == "fight":
+                    sel = "story"
+                elif ev.key == pygame.K_DOWN:
+                    sel = {"fight": "characters", "story": "characters", "characters": "settings"}.get(sel, sel)
+                elif ev.key == pygame.K_UP:
+                    sel = {"settings": "characters", "characters": last_top}.get(sel, sel)
+                if sel in ("fight", "story"):
+                    last_top = sel
+                if sel != old:
+                    AUDIO_MGR.play("menu_move")
+            if ev.type == pygame.MOUSEMOTION:
+                hit = _menu_hit(A, ev.pos)
+                if hit and hit != sel:
+                    sel = hit
+                    if sel in ("fight", "story"):
+                        last_top = sel
+                    AUDIO_MGR.play("menu_move")
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                hit = _menu_hit(A, ev.pos)
+                if hit:
+                    AUDIO_MGR.play("menu_ok")
+                    return hit
+            if is_confirm(ev):
+                AUDIO_MGR.play("menu_ok")
+                return sel
+            if is_back(ev):
+                if confirm_modal(screen, clock, ["¿Salir del juego?"], C_ORANGE,
+                                 f"{key_label('confirm')}: salir", f"{key_label('back')}: quedarme"):
+                    return None
+
+
+def info_screen(screen, clock, title, lines, color=C_YELLOW):
+    font_t = get_font("segoeui", 40, True)
+    font_s = get_font("segoeui", 18)
+    while True:
+        screen.fill(C_BG)
+        t = font_t.render(title, True, color)
+        screen.blit(t, t.get_rect(center=(WIN_W // 2, 130)))
+        for i, ln in enumerate(lines):
+            lbl = font_s.render(ln, True, C_WHITE)
+            screen.blit(lbl, lbl.get_rect(center=(WIN_W // 2, 230 + i * 30)))
+        hint = font_s.render(f"{key_label('back')}: volver", True, C_GRAY)
+        screen.blit(hint, hint.get_rect(center=(WIN_W // 2, WIN_H - 40)))
+        pygame.display.flip()
+        clock.tick(FPS)
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if is_back(ev) or is_confirm(ev):
+                return
+
+
+def characters_screen(screen, clock):
+    font_t = get_font("segoeui", 40, True)
+    font_n = get_font("segoeui", 34, True)
+    font_s = get_font("consolas", 15)
+    font_h = get_font("segoeui", 16)
+    idx = 0
+    while True:
+        name = CHARACTERS[idx]
+        screen.fill(C_BG)
+        t = font_t.render("CHARACTERS", True, C_YELLOW)
+        screen.blit(t, t.get_rect(center=(WIN_W // 2, 60)))
+        n = font_n.render(f"<   {name.upper()}   >", True, C_PINK)
+        screen.blit(n, n.get_rect(center=(WIN_W // 2, 170)))
+        spr = pygame.transform.scale(_placeholder(name + ".png", SPRITE_SIZE), (112, 112))
+        screen.blit(spr, spr.get_rect(center=(WIN_W // 2, 280)))
+        for i, ln in enumerate(HAB_INFO[name]):
+            lbl = font_s.render(ln, True, C_WHITE)
+            screen.blit(lbl, lbl.get_rect(center=(WIN_W // 2, 380 + i * 26)))
+        hint = font_h.render(f"← →: cambiar personaje        {key_label('back')}: volver", True, C_GRAY)
+        screen.blit(hint, hint.get_rect(center=(WIN_W // 2, WIN_H - 36)))
+        pygame.display.flip()
+        clock.tick(FPS)
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if is_back(ev):
+                return
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_RIGHT:
+                    idx = (idx + 1) % len(CHARACTERS)
+                if ev.key == pygame.K_LEFT:
+                    idx = (idx - 1) % len(CHARACTERS)
+
+
+# ═══════════════════════ OPENING EN VIDEO ═══════════════════════
+
+def find_opening():
+    """Busca VIDEO/opening.mp4 (o opening/intro con .mp4 .mov .avi .mkv .webm) junto al juego."""
+    for d in (os.path.join(BASE_DIR, "VIDEO"), BASE_DIR):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            stem, ext = os.path.splitext(n)
+            if stem.lower() in ("opening", "intro") and ext.lower() in (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"):
+                return os.path.join(d, n)
+    return None
+
+
+def play_opening(screen, clock):
+    """Reproduce el video de opening al abrir el juego. Se salta con la tecla de 'volver' (X)."""
+    if not OPENING_ENABLED:
+        return
+    path = find_opening()
+    if not path:
+        return
+    if not HAS_FFMPEG:
+        mp_message(screen, clock, "Hay un opening en la carpeta VIDEO pero falta la libreria.\n"
+                                  "Instalala con:  pip install imageio-ffmpeg", 4, C_YELLOW)
+        return
+
+    wav, proc = None, None
+    stop = threading.Event()
+    try:
+        exe   = imageio_ffmpeg.get_ffmpeg_exe()
+        quiet = dict(stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))   # sin ventana negra en Windows
+        AUDIO_MGR.stop_music()
+
+        # 1) el audio se extrae a un wav temporal
+        wav = os.path.join(tempfile.gettempdir(), f"filesmash_opening_{os.getpid()}.wav")
+        r = subprocess.run([exe, "-y", "-v", "error", "-i", path, "-vn", "-ac", "2", "-ar", "44100", "-f", "wav", wav],
+                           stdout=subprocess.DEVNULL, timeout=180, **quiet)
+        has_audio = r.returncode == 0 and os.path.exists(wav) and os.path.getsize(wav) > 1000
+
+        # 2) los frames salen como imagenes crudas a la medida de la ventana
+        vf = (f"fps={OPEN_FPS},scale={WIN_W}:{WIN_H}:force_original_aspect_ratio=decrease,"
+              f"pad={WIN_W}:{WIN_H}:(ow-iw)/2:(oh-ih)/2:black")
+        proc = subprocess.Popen([exe, "-v", "error", "-i", path, "-an", "-vf", vf,
+                                 "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                                stdout=subprocess.PIPE, **quiet)
+        q = queue.Queue(maxsize=45)
+        fsize = WIN_W * WIN_H * 3
+
+        def reader():
+            try:
+                while not stop.is_set():
+                    data = proc.stdout.read(fsize)
+                    if len(data) < fsize:
+                        break
+                    while not stop.is_set():
+                        try:
+                            q.put(data, timeout=0.2)
+                            break
+                        except queue.Full:
+                            pass
+            except Exception:
+                pass
+            try:
+                q.put(None, timeout=1)
+            except Exception:
+                pass
+
+        threading.Thread(target=reader, daemon=True).start()
+
+        if has_audio:
+            try:
+                pygame.mixer.music.load(wav)
+                pygame.mixer.music.play()
+            except Exception:
+                pass
+
+        font_h = get_font("segoeui", 15)
+        t0, idx, frame, done = time.time(), 0, None, False
+        while not done:
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if is_back(ev):
+                    done = True
+            target = int((time.time() - t0) * OPEN_FPS)
+            while idx <= target and not done:
+                try:
+                    data = q.get(timeout=0.25)
+                except queue.Empty:
+                    break                                   # el decodificador va lento: se queda el ultimo frame
+                if data is None:
+                    done = True
+                    break
+                frame = pygame.image.frombuffer(data, (WIN_W, WIN_H), "RGB")
+                idx += 1
+            screen.fill((0, 0, 0))
+            if frame is not None:
+                screen.blit(frame, (0, 0))
+            hint = font_h.render(f"{key_label('back')}: saltar", True, (210, 210, 210))
+            screen.blit(hint, (WIN_W - hint.get_width() - 14, WIN_H - 28))
+            pygame.display.flip()
+            clock.tick(60)
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        try:
+            with open(os.path.join(BASE_DIR, "opening_error.log"), "w", encoding="utf-8") as fh:
+                fh.write(traceback.format_exc())
+        except Exception:
+            pass
+    finally:
+        stop.set()
+        try:
+            if proc is not None:
+                proc.kill()
+        except Exception:
+            pass
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+        except Exception:
+            pass
+        try:
+            if wav and os.path.exists(wav):
+                os.remove(wav)
+        except Exception:
+            pass
 
 
 # ═══════════════════════ MENU ═══════════════════════
@@ -3006,7 +3761,7 @@ def menu(screen, clock, archivos):
     running = True
     while running:
         screen.fill(C_BG)
-        t = font_t.render("⚔  FILE SMASH  ⚔", True, C_YELLOW)
+        t = font_t.render("FILE SMASH  -  VS CPU", True, C_YELLOW)
         screen.blit(t, (WIN_W//2-t.get_width()//2, 18))
         sub = font_b.render(
             f"{len(archivos)} archivos  |  Grupos de {MAX_POR_RONDA}  |  Personajes: "
@@ -3061,20 +3816,20 @@ def menu(screen, clock, archivos):
                 _sz = 1
             _pr = file_profile(_sz)
             _l1 = font_xs.render(f"{os.path.basename(_sp)[:34]}  ({size_str(_sz)})", True, C_WHITE)
-            _l2 = font_xs.render(f"Vel x{_pr['speed']:.2f}  Peso x{_pr['weight']:.2f}  Daño x{_pr['dmg']:.2f}",
+            _l2 = font_xs.render(f"Vel x{_pr['speed']:.2f}  Peso x{_pr['weight']:.2f}  Daño x{_pr['dmg']:.2f}  Atq x{_pr['atk']:.2f}",
                                  True, C_CYAN)
             screen.blit(_l1, (60, WIN_H - 66))
             screen.blit(_l2, (60, WIN_H - 50))
 
         pygame.draw.rect(screen, C_ORANGE, btn_start, border_radius=8)
         pygame.draw.rect(screen, C_YELLOW, btn_start, 2, border_radius=8)
-        btn_txt = "▶  INICIAR" + (
+        btn_txt = ">  INICIAR" + (
             f"  ({os.path.basename(archivos[selected])[:20]})"
             if selected is not None else "  (todo IA)")
         btl = font_b.render(btn_txt, True, C_DARK)
         screen.blit(btl, btl.get_rect(center=btn_start.center))
 
-        enter_lbl = font_xs.render("o presiona ENTER para iniciar", True, C_GRAY)
+        enter_lbl = font_xs.render(f"o presiona {key_label('confirm')} para iniciar      {key_label('back')}: volver", True, C_GRAY)
         screen.blit(enter_lbl, enter_lbl.get_rect(center=(WIN_W//2, WIN_H-8)))
 
         pygame.display.flip()
@@ -3084,11 +3839,11 @@ def menu(screen, clock, archivos):
             if ev.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
             if ev.type == pygame.KEYDOWN:
-                if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                if is_confirm(ev):
                     AUDIO_MGR.stop_music()
                     return selected, char_assign
-                if ev.key == pygame.K_ESCAPE:
-                    pygame.quit(); sys.exit()
+                if is_back(ev):
+                    return None
                 if ev.key == pygame.K_c and selected is not None:
                     cur = char_assign[archivos[selected]]
                     char_assign[archivos[selected]] = CHARACTERS[(CHARACTERS.index(cur) + 1) % len(CHARACTERS)]
@@ -3145,6 +3900,7 @@ def run_round(screen, clock, archivos_ronda, player_path,
                 if ev.type == pygame.QUIT: pygame.quit(); sys.exit()
 
     prev_special = False
+    rframe = 0
 
     while True:
         keys = pygame.key.get_pressed()
@@ -3199,11 +3955,16 @@ def run_round(screen, clock, archivos_ronda, player_path,
                     print(f"[ERROR] {f.name}: {e}")
 
         prev_special = cur_special
+        rframe += 1
+        if rframe == SUDDEN_DEATH_FRAMES:
+            del platforms[1:]            # muerte subita: evita rondas eternas (CPUs que no se alcanzan)
 
         # Dibujar
         draw_stage(screen, platforms)
         for f in fighters: f.draw(screen)
         draw_hud(screen, fighters, round_num, total_rounds)
+        if SUDDEN_DEATH_FRAMES <= rframe < SUDDEN_DEATH_FRAMES + FPS * 3:
+            _draw_banner(screen, "MUERTE SUBITA: solo queda el escenario principal", C_RED, 90)
 
         # Ganador
         alive_now = [f for f in fighters if f.alive]
@@ -3214,7 +3975,7 @@ def run_round(screen, clock, archivos_ronda, player_path,
                     draw_stage(screen, platforms)
                     winner.draw(screen)
                     draw_hud(screen, fighters, round_num, total_rounds)
-                    msg = font_med.render(f"🏆  {winner.name[:40]}  GANA!", True, C_YELLOW)
+                    msg = font_med.render(f"{winner.name[:40]}  GANA!", True, C_YELLOW)
                     pygame.draw.rect(screen, C_DARK,
                                      msg.get_rect(center=(WIN_W//2, WIN_H//2)).inflate(20,14),
                                      border_radius=6)
@@ -3234,7 +3995,10 @@ def run_round(screen, clock, archivos_ronda, player_path,
 
 def play_cpu_mode(screen, clock, archivos):
     """Torneo contra CPUs con todos los archivos de PVP. El perdedor se borra del disco."""
-    player_idx, char_assign = menu(screen, clock, archivos)
+    res = menu(screen, clock, archivos)
+    if res is None:
+        return False                      # volvio atras
+    player_idx, char_assign = res
     player_path = archivos[player_idx] if player_idx is not None else None
 
     sobrevivientes = archivos[:]
@@ -3268,20 +4032,42 @@ def play_cpu_mode(screen, clock, archivos):
         while not done:
             screen.fill(C_BG)
             screen.blit(spr, (WIN_W//2-60, WIN_H//2-110))
-            lbl = font_big.render(f"👑  {campeon[:40]}", True, C_YELLOW)
+            lbl = font_big.render(f"CAMPEON:  {campeon[:34]}", True, C_YELLOW)
             screen.blit(lbl, lbl.get_rect(center=(WIN_W//2, WIN_H//2+40)))
-            sub = font_med.render("¡CAMPEÓN ABSOLUTO!  —  ESC para salir", True, C_ORANGE)
+            sub = font_med.render(f"¡CAMPEÓN ABSOLUTO!  —  {key_label('back')} para salir", True, C_ORANGE)
             screen.blit(sub, sub.get_rect(center=(WIN_W//2, WIN_H//2+80)))
             pygame.display.flip(); clock.tick(FPS)
             for ev in pygame.event.get():
-                if ev.type == pygame.QUIT or (
-                   ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE):
+                if ev.type == pygame.QUIT or is_back(ev) or is_confirm(ev):
                     done = True
+    return True
+
+
+def set_window_icon():
+    """Icono de la ventana y de la barra de tareas (el de pygame sale por defecto).
+    Busca icon.ico / icon.png (da igual mayusculas) junto al juego o dentro del .exe."""
+    dirs = [BASE_DIR]
+    if getattr(sys, "_MEIPASS", None):
+        dirs.insert(0, sys._MEIPASS)            # archivos metidos dentro del .exe con --add-data
+    for d in dirs:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if n.lower() in ("icon.ico", "icon.png", "icono.ico", "icono.png"):
+                try:
+                    im = PILImage.open(os.path.join(d, n)).convert("RGBA").resize((64, 64))
+                    pygame.display.set_icon(pygame.image.fromstring(im.tobytes(), im.size, "RGBA"))
+                    return
+                except Exception:
+                    pass
 
 
 def info_window(lines, secs=25):
     """Ventana simple con un aviso. Sirve tambien en el .exe, que no tiene consola."""
     pygame.init()
+    set_window_icon()
     scr  = pygame.display.set_mode((820, 130 + 26 * len(lines)))
     pygame.display.set_caption("⚔ FILE SMASH ⚔")
     clk  = pygame.time.Clock()
@@ -3308,35 +4094,53 @@ def main():
     if not os.path.isdir(PVP_FOLDER):
         os.makedirs(PVP_FOLDER)
         info_window(["Se creo la carpeta PVP:", PVP_FOLDER, "",
-                     "Pon ahi COPIAS de los archivos que van a pelear (el perdedor se borra en VS CPU)",
+                     "Pon ahi COPIAS de los archivos que van a pelear (el que pierde se BORRA)",
                      "y vuelve a abrir el juego."])
         return
 
-    archivos = sorted([
-        os.path.join(PVP_FOLDER, f)
-        for f in os.listdir(PVP_FOLDER)
-        if os.path.isfile(os.path.join(PVP_FOLDER, f))
-    ])
-    if len(archivos) < 1:
+    if len(list_pvp_files()) < 1:
         info_window(["La carpeta PVP esta vacia:", PVP_FOLDER, "",
                      "Pon al menos 1 archivo (2 o mas para jugar contra CPUs) y vuelve a abrir el juego."])
         return
 
     pygame.init()
+    set_window_icon()                       # antes de crear la ventana
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     pygame.display.set_caption("⚔ FILE SMASH ⚔")
     clock  = pygame.time.Clock()
     AUDIO_MGR = AudioManager()
+    load_settings()
+    play_opening(screen, clock)
 
-    while True:
-        mode = mode_screen(screen, clock, len(archivos))
-        if mode == "cpu":
-            play_cpu_mode(screen, clock, archivos)
+    running = True
+    while running:
+        choice = main_menu(screen, clock)
+        if choice is None:
             break
-        elif mode == "mp":
-            multiplayer_menu(screen, clock, archivos)
-        else:
-            break
+        if choice == "fight":
+            while True:
+                files = list_pvp_files()
+                mode = mode_screen(screen, clock, len(files))
+                if mode is None:
+                    break
+                if mode == "cpu":
+                    if play_cpu_mode(screen, clock, files):
+                        running = False             # termino el torneo: se cierra como antes
+                        break
+                elif mode == "mp":
+                    multiplayer_menu(screen, clock)
+        elif choice == "story":
+            info_screen(screen, clock, "STORY MODE",
+                        ["Muy pronto...", "",
+                         "Pelea contra el SYSTEM32 desatado",
+                         "y salva tu laptop de la destruccion!"])
+        elif choice == "characters":
+            characters_screen(screen, clock)
+        elif choice == "settings":
+            info_screen(screen, clock, "SETTINGS",
+                        [f"Controles de los menus:   {key_label('confirm')} = continuar     {key_label('back')} = volver",
+                         "(Enter y Esc tambien funcionan)", "",
+                         "Muy pronto podras cambiarlos desde aqui."])
     pygame.quit()
 
 

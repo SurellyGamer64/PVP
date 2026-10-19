@@ -5,8 +5,8 @@ No simula el juego: solo une al HOST de una sala con los demas jugadores y les
 reenvia los mensajes. Todos se conectan HACIA el servidor, asi nadie necesita
 abrir puertos en su router.
 
-Uso local / LAN:   python relay_server.py            (puerto 8765)
-En Render:         Start Command  ->  python relay_server.py
+Uso local / LAN:   python RELAYSERV.py            (puerto 8765)
+En Render:         Start Command  ->  python RELAYSERV.py
                    (Render le da el puerto en la variable PORT; ya esta contemplado)
 Requisito:         pip install websockets   (version 12 o mayor)
 
